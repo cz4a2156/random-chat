@@ -1,6 +1,7 @@
 import os
 import json
 import uuid
+import time
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -10,33 +11,35 @@ import geoip2.database
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
+# =========================
+# Config
+# =========================
 APP_TITLE = "ランダムテキストチャット（超シンプル）"
 DB_PATH = os.getenv("DB_PATH", "app.db")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")  # RenderのEnvironmentで設定推奨
+GEOIP_DB_PATH = os.getenv("GEOIP_DB_PATH", "GeoLite2-City.mmdb")  # mmdbを同階層に置く or Path指定
 
-# GeoIP DB
-GEOIP_DB_PATH = os.getenv("GEOIP_DB_PATH", "GeoLite2-City.mmdb")
 _geo_reader = None
 
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-import time
 
+# =========================
+# Fake online (display only)
+# 2分ごとに 3→4→5 を循環
+# =========================
 def fake_online_offset() -> int:
-    """
-    2分ごとに 3 → 4 → 5 を循環
-    """
-    cycle = (int(time.time()) // 120) % 3  # 120秒ごと
-    return 3 + cycle
+    cycle = (int(time.time()) // 120) % 3  # 0,1,2
+    return 3 + cycle  # 3,4,5
 
 
-# ---------------------------
-# DB helpers
-# ---------------------------
+# =========================
+# DB
+# =========================
 def db_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
@@ -53,11 +56,12 @@ def init_db():
     conn = db_conn()
     cur = conn.cursor()
 
-    cur.execute("""
+    cur.execute(
+        """
     CREATE TABLE IF NOT EXISTS ws_connections (
         id TEXT PRIMARY KEY,
         ts TEXT NOT NULL,
-        event TEXT NOT NULL,                 -- connect / disconnect
+        event TEXT NOT NULL,           -- connect / disconnect
         client_id TEXT,
         session_id TEXT,
         ip TEXT,
@@ -67,14 +71,15 @@ def init_db():
         subdivision TEXT,
         user_agent TEXT
     )
-    """)
+    """
+    )
 
-    # 後から列追加（既存DBを壊さない）
     _ensure_column(cur, "ws_connections", "region", "TEXT")
     _ensure_column(cur, "ws_connections", "city", "TEXT")
     _ensure_column(cur, "ws_connections", "subdivision", "TEXT")
 
-    cur.execute("""
+    cur.execute(
+        """
     CREATE TABLE IF NOT EXISTS ws_sessions (
         session_id TEXT PRIMARY KEY,
         ts_start TEXT NOT NULL,
@@ -92,7 +97,8 @@ def init_db():
         subdivision_a TEXT,
         subdivision_b TEXT
     )
-    """)
+    """
+    )
 
     _ensure_column(cur, "ws_sessions", "region_a", "TEXT")
     _ensure_column(cur, "ws_sessions", "region_b", "TEXT")
@@ -101,7 +107,8 @@ def init_db():
     _ensure_column(cur, "ws_sessions", "subdivision_a", "TEXT")
     _ensure_column(cur, "ws_sessions", "subdivision_b", "TEXT")
 
-    cur.execute("""
+    cur.execute(
+        """
     CREATE TABLE IF NOT EXISTS ws_messages (
         id TEXT PRIMARY KEY,
         ts TEXT NOT NULL,
@@ -109,7 +116,8 @@ def init_db():
         sender_client_id TEXT NOT NULL,
         text TEXT NOT NULL
     )
-    """)
+    """
+    )
 
     conn.commit()
     conn.close()
@@ -124,14 +132,26 @@ def db_insert_connection(
     region: str,
     city: str,
     subdivision: str,
-    ua: str
+    ua: str,
 ):
     conn = db_conn()
     conn.execute(
         """INSERT INTO ws_connections
         (id, ts, event, client_id, session_id, ip, country, region, city, subdivision, user_agent)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (str(uuid.uuid4()), utc_now_iso(), event, client_id, session_id, ip, country, region, city, subdivision, ua[:500]),
+        (
+            str(uuid.uuid4()),
+            utc_now_iso(),
+            event,
+            client_id,
+            session_id,
+            ip,
+            country,
+            region,
+            city,
+            subdivision,
+            (ua or "unknown")[:500],
+        ),
     )
     conn.commit()
     conn.close()
@@ -155,11 +175,24 @@ def db_start_session(
     conn = db_conn()
     conn.execute(
         """INSERT INTO ws_sessions
-        (session_id, ts_start, client_a, client_b, ip_a, ip_b, country_a, country_b,
-         region_a, region_b, city_a, city_b, subdivision_a, subdivision_b)
+        (session_id, ts_start, client_a, client_b, ip_a, ip_b, country_a, country_b, region_a, region_b, city_a, city_b, subdivision_a, subdivision_b)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (session_id, utc_now_iso(), a, b, ip_a, ip_b, country_a, country_b,
-         region_a, region_b, city_a, city_b, subdivision_a, subdivision_b),
+        (
+            session_id,
+            utc_now_iso(),
+            a,
+            b,
+            ip_a,
+            ip_b,
+            country_a,
+            country_b,
+            region_a,
+            region_b,
+            city_a,
+            city_b,
+            subdivision_a,
+            subdivision_b,
+        ),
     )
     conn.commit()
     conn.close()
@@ -179,16 +212,17 @@ def db_insert_message(session_id: str, sender: str, text: str):
     conn = db_conn()
     conn.execute(
         "INSERT INTO ws_messages (id, ts, session_id, sender_client_id, text) VALUES (?, ?, ?, ?, ?)",
-        (str(uuid.uuid4()), utc_now_iso(), session_id, sender, text[:2000]),
+        (str(uuid.uuid4()), utc_now_iso(), session_id, sender, (text or "")[:2000]),
     )
     conn.commit()
     conn.close()
 
 
-# ---------------------------
+# =========================
 # IP / Geo
-# ---------------------------
+# =========================
 def get_client_ip(ws: WebSocket) -> str:
+    # Render等のプロキシ越しで x-forwarded-for が来る
     xff = ws.headers.get("x-forwarded-for")
     if xff:
         return xff.split(",")[0].strip()
@@ -207,12 +241,11 @@ def _get_geo_reader():
 def get_geo(ip: str) -> Tuple[str, str, str, str]:
     """
     return: (country_code, region_name, city_name, subdivision_name)
-    region: 都道府県/州レベル
-    subdivision: “区”っぽい情報が出ることがある（DB次第）
+    region: 都道府県/州っぽい
+    subdivision: 区っぽい（DB次第）
     """
     if ip in ("unknown", "127.0.0.1"):
         return ("unknown", "unknown", "unknown", "unknown")
-
     try:
         reader = _get_geo_reader()
         r = reader.city(ip)
@@ -225,7 +258,6 @@ def get_geo(ip: str) -> Tuple[str, str, str, str]:
             most = r.subdivisions.most_specific
             if most and most.name:
                 region = most.name
-            # subdivisionsが複数あると “区” っぽいのが入ることがある（国・DBによる）
             if len(r.subdivisions) >= 2 and r.subdivisions[1].name:
                 subdivision = r.subdivisions[1].name
 
@@ -243,9 +275,9 @@ def require_admin(request: Request):
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
-# ---------------------------
-# Matchmaking + counts
-# ---------------------------
+# =========================
+# Matchmaking
+# =========================
 @dataclass
 class ClientInfo:
     ws: WebSocket
@@ -263,14 +295,13 @@ class ClientInfo:
 class Matchmaker:
     def __init__(self):
         self.clients: Dict[str, ClientInfo] = {}
-        self.waiting: Optional[str] = None
+        self.waiting: Optional[str] = None  # 待機中の1人だけ
 
     def online_count(self) -> int:
         return len(self.clients)
 
-    def idle_count(self) -> int:
-        # 相手がいない（待機中 or 未マッチ）の人数
-        return sum(1 for c in self.clients.values() if c.partner_id is None)
+    def waiting_count(self) -> int:
+        return 1 if (self.waiting and self.waiting in self.clients and not self.clients[self.waiting].partner_id) else 0
 
     def add_client(self, info: ClientInfo):
         self.clients[info.client_id] = info
@@ -281,7 +312,7 @@ class Matchmaker:
 
         info = self.clients.get(client_id)
 
-        # 相手がいたら相手も解除＆セッション終了
+        # 相手がいるなら相手側を解放
         if info and info.partner_id:
             partner = self.clients.get(info.partner_id)
             if partner:
@@ -295,17 +326,36 @@ class Matchmaker:
 
         self.clients.pop(client_id, None)
 
-        # waitingが死んでたら解除
-        if self.waiting and self.waiting not in self.clients:
-            self.waiting = None
+    def force_end_my_session(self, client_id: str) -> Optional[str]:
+        """client_id のセッションを強制終了して、相手に ended を送るため相手IDを返す"""
+        me = self.clients.get(client_id)
+        if not me:
+            return None
+        partner_id = me.partner_id
+        sid = me.session_id
+
+        me.partner_id = None
+        me.session_id = None
+        if sid:
+            db_end_session(sid)
+
+        if partner_id and partner_id in self.clients:
+            partner = self.clients[partner_id]
+            partner.partner_id = None
+            partner.session_id = None
+        return partner_id
 
     def match(self, client_id: str) -> Tuple[bool, Optional[str]]:
         me = self.clients.get(client_id)
         if not me or me.partner_id:
             return False, None
 
-        # waitingが空 or 無効なら自分をwaitingに
-        if not self.waiting or self.waiting not in self.clients or self.clients[self.waiting].partner_id:
+        # waiting が無効なら自分が waiting に入る
+        if (
+            not self.waiting
+            or self.waiting not in self.clients
+            or self.clients[self.waiting].partner_id
+        ):
             self.waiting = client_id
             return False, None
 
@@ -328,43 +378,27 @@ class Matchmaker:
 
         db_start_session(
             session_id,
-            me.client_id, other.client_id,
-            me.ip, other.ip,
-            me.country, other.country,
-            me.region, other.region,
-            me.city, other.city,
-            me.subdivision, other.subdivision,
+            me.client_id,
+            other.client_id,
+            me.ip,
+            other.ip,
+            me.country,
+            other.country,
+            me.region,
+            other.region,
+            me.city,
+            other.city,
+            me.subdivision,
+            other.subdivision,
         )
         return True, other_id
 
 
 mm = Matchmaker()
 
-
-async def broadcast_counts():
-    """
-    全クライアントに接続数・待機数を配信
-    """
-    payload = json.dumps({
-        "type": "counts",
-        "online": mm.online_count(),
-        "idle": mm.idle_count(),
-    })
-
-    dead: List[str] = []
-    for cid, info in mm.clients.items():
-        try:
-            await info.ws.send_text(payload)
-        except Exception:
-            dead.append(cid)
-
-    for cid in dead:
-        mm.remove_client(cid)
-
-
-# ---------------------------
+# =========================
 # FastAPI
-# ---------------------------
+# =========================
 app = FastAPI(title="random-chat-logs")
 init_db()
 
@@ -374,77 +408,127 @@ INDEX_HTML = f"""
 <head>
   <meta charset="utf-8">
   <title>{APP_TITLE}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; max-width: 920px; margin: 24px auto; padding: 0 12px; }}
+    .row {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }}
+    button {{ padding: 10px 14px; }}
+    #log {{ border:1px solid #ddd; padding:10px; height:420px; overflow:auto; margin-top:12px; border-radius:10px; background:#fff; }}
+    .badge {{ padding:6px 10px; border-radius:999px; background:#f2f2f2; }}
+    input {{ padding:10px; border-radius:10px; border:1px solid #ddd; }}
+  </style>
 </head>
-<body style="font-family: sans-serif; max-width: 900px; margin: 30px auto;">
+<body>
   <h2>{APP_TITLE}</h2>
 
-  <div style="display:flex; align-items:center; gap:8px;">
+  <div class="row">
     <button id="btnStart">開始</button>
     <button id="btnNext" disabled>次の人</button>
     <button id="btnDisconnect" disabled>切断</button>
-    <span id="status" style="margin-left:12px;color:#666;"></span>
+    <span class="badge">オンライン表示: <b id="onlineDisplay">-</b></span>
+    <span class="badge">待機中: <b id="waitingNow">-</b></span>
   </div>
 
-  <div style="border:1px solid #ddd; padding:10px; height:420px; overflow:auto; margin-top:12px;" id="log"></div>
+  <div id="log"></div>
 
-  <div style="margin-top:12px; display:flex; gap:8px;">
-    <input id="msg" placeholder="メッセージ..." style="flex:1;">
+  <div class="row" style="margin-top:12px;">
+    <input id="msg" placeholder="メッセージ..." style="width:min(520px, 72vw);">
     <button id="btnSend" disabled>送信</button>
   </div>
 
 <script>
-let ws=null;
+let ws = null;
+let matched = false;
 
-// 同一ブラウザ内では同一ユーザー扱い（自分とマッチしない）
 let clientId = localStorage.getItem("client_id");
 if(!clientId) {{
   clientId = crypto.randomUUID();
   localStorage.setItem("client_id", clientId);
 }}
 
+const elLog = document.getElementById("log");
 const log = (s) => {{
-  const el=document.getElementById("log");
-  el.innerHTML += s + "<br>";
-  el.scrollTop = el.scrollHeight;
+  elLog.innerHTML += s + "<br>";
+  elLog.scrollTop = elLog.scrollHeight;
 }};
 
-// ---- SFX (WebAudio) ----
-let audioCtx = null;
-function beep(freq, durationMs, type="sine", gainValue=0.06) {{
+function setUIConnected(isConnected) {{
+  document.getElementById("btnDisconnect").disabled = !isConnected;
+  if(!isConnected) {{
+    document.getElementById("btnSend").disabled = true;
+    document.getElementById("btnNext").disabled = true;
+    matched = false;
+  }}
+}}
+
+function setUIMatched(isMatched) {{
+  matched = isMatched;
+  document.getElementById("btnSend").disabled = !isMatched;
+  document.getElementById("btnNext").disabled = !isMatched;
+}}
+
+function beepSequence(steps) {{
+  // WebAudio: steps = [{freq, dur, gap, type}]
   try {{
-    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const osc = audioCtx.createOscillator();
-    const gain = audioCtx.createGain();
-    osc.type = type;
-    osc.frequency.value = freq;
-    gain.gain.value = gainValue;
-    osc.connect(gain);
-    gain.connect(audioCtx.destination);
-    osc.start();
-    setTimeout(() => osc.stop(), durationMs);
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    let t = ctx.currentTime;
+    steps.forEach(st => {{
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = st.type || "sine";
+      o.frequency.value = st.freq;
+
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.15, t + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + st.dur);
+
+      o.connect(g);
+      g.connect(ctx.destination);
+
+      o.start(t);
+      o.stop(t + st.dur);
+
+      t += st.dur + (st.gap || 0.02);
+    }});
+  }} catch(e) {{
+    // 音が出せない環境でも無視
+  }}
+}}
+
+function playMatchSound() {{
+  // テンション上がる：上昇音
+  beepSequence([
+    {{freq: 660, dur: 0.08, gap: 0.02, type:"triangle"}},
+    {{freq: 880, dur: 0.08, gap: 0.02, type:"triangle"}},
+    {{freq: 1100, dur: 0.10, gap: 0.00, type:"triangle"}},
+  ]);
+}}
+
+function playEndSound() {{
+  // テンション下がる：下降音
+  beepSequence([
+    {{freq: 440, dur: 0.10, gap: 0.02, type:"sine"}},
+    {{freq: 330, dur: 0.12, gap: 0.00, type:"sine"}},
+  ]);
+}}
+
+async function refreshOnline() {{
+  try {{
+    const r = await fetch("/api/online");
+    const j = await r.json();
+    document.getElementById("onlineDisplay").textContent = j.online_display;
+    document.getElementById("waitingNow").textContent = j.waiting_now;
   }} catch(e) {{}}
 }}
-
-function sfxMatched() {{
-  beep(880, 120, "square", 0.05);
-  setTimeout(()=>beep(1175, 160, "square", 0.05), 140);
-}}
-
-function sfxEnded() {{
-  beep(440, 160, "sine", 0.05);
-  setTimeout(()=>beep(330, 220, "sine", 0.05), 180);
-}}
-
-function setStatus(text) {{
-  document.getElementById("status").textContent = text || "";
-}}
+setInterval(refreshOnline, 2000);
+refreshOnline();
 
 function connect() {{
   ws = new WebSocket((location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/ws?client_id="+encodeURIComponent(clientId));
 
   ws.onopen = ()=> {{
+    setUIConnected(true);
     log("✅ 接続しました。マッチング中...");
-    document.getElementById("btnDisconnect").disabled=false;
     ws.send(JSON.stringify({{type:"start"}}));
   }};
 
@@ -453,65 +537,63 @@ function connect() {{
 
     if(data.type==="matched") {{
       log("🎉 マッチしました！");
-      sfxMatched();
-      document.getElementById("btnSend").disabled=false;
-      document.getElementById("btnNext").disabled=false;
-      document.getElementById("btnDisconnect").disabled=false;
-
+      setUIMatched(true);
+      playMatchSound();
     }} else if(data.type==="system") {{
       log("（システム）"+data.text);
-
     }} else if(data.type==="msg") {{
       log("相手: "+data.text);
-
     }} else if(data.type==="ended") {{
       log("🚪 相手が退出しました。終了します。");
-      sfxEnded();
-      document.getElementById("btnSend").disabled=true;
-      document.getElementById("btnNext").disabled=true;
-
-    }} else if(data.type==="counts") {{
-      setStatus(`接続中: ${{data.online}} / 待機: ${{data.idle}}`);
+      setUIMatched(false);
+      playEndSound();
+    }} else if(data.type==="disconnect_ack") {{
+      log("🧹 切断しました。");
+      setUIMatched(false);
+      playEndSound();
+      try {{ ws.close(); }} catch(e) {{}}
     }}
   }};
 
   ws.onclose = ()=> {{
     log("🗡 切断しました。");
-    sfxEnded();
-    document.getElementById("btnSend").disabled=true;
-    document.getElementById("btnNext").disabled=true;
-    document.getElementById("btnDisconnect").disabled=true;
+    setUIConnected(false);
   }};
 }}
 
-document.getElementById("btnStart").onclick=()=> {{
+document.getElementById("btnStart").onclick = async ()=> {{
+  // iOS等で音を鳴らすにはユーザー操作の直後が安全なので、ここでAudioContextを起こす意図もある
   if(ws && ws.readyState===1) return;
   connect();
 }};
 
-document.getElementById("btnNext").onclick=()=> {{
+document.getElementById("btnNext").onclick = ()=> {{
   if(ws && ws.readyState===1) {{
     ws.send(JSON.stringify({{type:"next"}}));
-    document.getElementById("btnSend").disabled=true;
-    document.getElementById("btnNext").disabled=true;
+    setUIMatched(false);
     log("（システム）待機中...相手を探しています");
   }}
 }};
 
-document.getElementById("btnDisconnect").onclick=()=> {{
+document.getElementById("btnDisconnect").onclick = ()=> {{
   if(ws && ws.readyState===1) {{
-    try {{ ws.send(JSON.stringify({{type:"disconnect"}})); }} catch(e) {{}}
-    ws.close();
+    ws.send(JSON.stringify({{type:"disconnect"}}));
   }}
 }};
 
-document.getElementById("btnSend").onclick=()=> {{
-  const t=document.getElementById("msg").value;
+document.getElementById("btnSend").onclick = ()=> {{
+  const t = document.getElementById("msg").value;
   if(!t) return;
   document.getElementById("msg").value="";
   log("あなた: "+t);
   ws.send(JSON.stringify({{type:"msg", text:t}}));
 }};
+
+document.getElementById("msg").addEventListener("keydown", (e)=> {{
+  if(e.key === "Enter") {{
+    document.getElementById("btnSend").click();
+  }}
+}});
 </script>
 </body>
 </html>
@@ -523,12 +605,31 @@ def index():
     return INDEX_HTML
 
 
-# ---------------------------
+# =========================
+# Public tiny API (UI polling)
+# =========================
+@app.get("/api/online")
+def api_online():
+    real = mm.online_count()
+    fake = fake_online_offset()
+    return JSONResponse(
+        {
+            "online_real": real,
+            "online_display": real + fake,
+            "waiting_now": mm.waiting_count(),
+        }
+    )
+
+
+# =========================
 # Admin APIs
-# ---------------------------
+# =========================
 @app.get("/admin/stats")
 def admin_stats(request: Request):
     require_admin(request)
+
+    real = mm.online_count()
+    fake = fake_online_offset()
 
     conn = db_conn()
     cur = conn.cursor()
@@ -540,14 +641,16 @@ def admin_stats(request: Request):
     total_msgs = cur.fetchone()[0]
     conn.close()
 
-    return JSONResponse({
-        "online_real": real,
-        "online_display": real + fake,
-        "idle_now": mm.idle_count(),
-        "total_connects": total_connects,
-        "total_disconnects": total_disconnects,
-        "total_messages": total_msgs,
-    })
+    return JSONResponse(
+        {
+            "online_real": real,
+            "online_display": real + fake,
+            "waiting_now": mm.waiting_count(),
+            "total_connects": total_connects,
+            "total_disconnects": total_disconnects,
+            "total_messages": total_msgs,
+        }
+    )
 
 
 @app.get("/admin/recent")
@@ -558,36 +661,39 @@ def admin_recent(request: Request, limit: int = 50):
     conn = db_conn()
     cur = conn.cursor()
     cur.execute(
-        "SELECT ts, event, client_id, session_id, ip, country, region, city, subdivision "
-        "FROM ws_connections ORDER BY ts DESC LIMIT ?",
+        """
+        SELECT ts, event, client_id, session_id, ip, country, region, city, subdivision
+        FROM ws_connections
+        ORDER BY ts DESC
+        LIMIT ?
+        """,
         (limit,),
     )
     rows = cur.fetchall()
     conn.close()
 
-    return JSONResponse({
-        "connections": [
-            {
-                "ts": r[0],
-                "event": r[1],
-                "client_id": r[2],
-                "session_id": r[3],
-                "ip": r[4],
-                "country": r[5],
-                "region": r[6],
-                "city": r[7],
-                "subdivision": r[8],
-            }
-            for r in rows
-        ]
-    })
+    return JSONResponse(
+        {
+            "connections": [
+                {
+                    "ts": r[0],
+                    "event": r[1],
+                    "client_id": r[2],
+                    "session_id": r[3],
+                    "ip": r[4],
+                    "country": r[5],
+                    "region": r[6],
+                    "city": r[7],
+                    "subdivision": r[8],
+                }
+                for r in rows
+            ]
+        }
+    )
 
 
 @app.get("/admin/messages")
 def admin_messages(request: Request, limit: int = 100):
-    """
-    直近メッセージ（会話ログ）を見る
-    """
     require_admin(request)
     limit = max(1, min(limit, 500))
 
@@ -605,19 +711,26 @@ def admin_messages(request: Request, limit: int = 100):
     rows = cur.fetchall()
     conn.close()
 
-    return JSONResponse({
-        "messages": [
-            {"ts": r[0], "session_id": r[1], "sender": r[2], "text": r[3]}
-            for r in rows
-        ]
-    })
+    return JSONResponse(
+        {
+            "messages": [
+                {
+                    "ts": r[0],
+                    "session_id": r[1],
+                    "sender": r[2],
+                    "text": r[3],
+                }
+                for r in rows
+            ]
+        }
+    )
 
 
 @app.get("/admin/geo_summary")
 def admin_geo_summary(request: Request, region: Optional[str] = None, limit: int = 50):
     """
-    地域別（region/city/subdivision）集計
-    region=（実際に出てくる表記）で絞れる
+    地域（region/city/subdivision）別の connect 集計
+    region を指定すると、その地域だけに絞る
     """
     require_admin(request)
     limit = max(1, min(limit, 200))
@@ -653,17 +766,59 @@ def admin_geo_summary(request: Request, region: Optional[str] = None, limit: int
     rows = cur.fetchall()
     conn.close()
 
-    return JSONResponse({
-        "rows": [
-            {"region": r[0] or "unknown", "city": r[1] or "unknown", "subdivision": r[2] or "unknown", "connects": r[3]}
-            for r in rows
-        ]
-    })
+    return JSONResponse(
+        {
+            "rows": [
+                {
+                    "region": r[0] or "unknown",
+                    "city": r[1] or "unknown",
+                    "subdivision": r[2] or "unknown",
+                    "connects": r[3],
+                }
+                for r in rows
+            ]
+        }
+    )
 
 
-# ---------------------------
-# WebSocket endpoint
-# ---------------------------
+# （大阪固定が気になるなら、これは削除してOK。残したい場合だけ使ってね）
+@app.get("/admin/osaka_top")
+def admin_osaka_top(request: Request, limit: int = 50):
+    """
+    大阪府内だけの city/subdivision 上位（オマケ）
+    """
+    require_admin(request)
+    limit = max(1, min(limit, 200))
+
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT city, subdivision, COUNT(*) as c
+        FROM ws_connections
+        WHERE event='connect' AND region = 'Osaka'
+        GROUP BY city, subdivision
+        ORDER BY c DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    return JSONResponse(
+        {
+            "rows": [
+                {"city": r[0] or "unknown", "subdivision": r[1] or "unknown", "connects": r[2]}
+                for r in rows
+            ]
+        }
+    )
+
+
+# =========================
+# WebSocket
+# =========================
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket, client_id: str):
     await ws.accept()
@@ -684,17 +839,12 @@ async def ws_endpoint(ws: WebSocket, client_id: str):
     )
     mm.add_client(info)
 
-    # connectログ
     db_insert_connection("connect", client_id, None, ip, country, region, city, subdivision, ua)
-
-    # counts配信
-    await broadcast_counts()
 
     try:
         while True:
             raw = await ws.receive_text()
             data = json.loads(raw)
-
             typ = data.get("type")
             me = mm.clients.get(client_id)
 
@@ -706,24 +856,22 @@ async def ws_endpoint(ws: WebSocket, client_id: str):
                     if other and me:
                         await me.ws.send_text(json.dumps({"type": "matched"}))
                         await other.ws.send_text(json.dumps({"type": "matched"}))
-                await broadcast_counts()
 
             elif typ == "next":
-                # 現在の相手を切って再待機
+                # 今の相手を切って次へ
                 if me and me.partner_id:
                     partner = mm.clients.get(me.partner_id)
                     sid = me.session_id
-
                     me.partner_id = None
                     me.session_id = None
                     if sid:
                         db_end_session(sid)
-
                     if partner:
                         partner.partner_id = None
                         partner.session_id = None
                         await partner.ws.send_text(json.dumps({"type": "ended"}))
 
+                await ws.send_text(json.dumps({"type": "system", "text": "待機中...相手を探しています"}))
                 matched, other_id = mm.match(client_id)
                 if matched and other_id:
                     other = mm.clients.get(other_id)
@@ -731,26 +879,16 @@ async def ws_endpoint(ws: WebSocket, client_id: str):
                         await me.ws.send_text(json.dumps({"type": "matched"}))
                         await other.ws.send_text(json.dumps({"type": "matched"}))
 
-                await broadcast_counts()
-
             elif typ == "disconnect":
                 # 自分から切断
-                if me and me.partner_id:
-                    partner = mm.clients.get(me.partner_id)
-                    sid = me.session_id
-
-                    me.partner_id = None
-                    me.session_id = None
-                    if sid:
-                        db_end_session(sid)
-
-                    if partner:
-                        partner.partner_id = None
-                        partner.session_id = None
-                        await partner.ws.send_text(json.dumps({"type": "ended"}))
-
-                await broadcast_counts()
-                await ws.close()
+                partner_id = mm.force_end_my_session(client_id)
+                if partner_id and partner_id in mm.clients:
+                    try:
+                        await mm.clients[partner_id].ws.send_text(json.dumps({"type": "ended"}))
+                    except Exception:
+                        pass
+                await ws.send_text(json.dumps({"type": "disconnect_ack"}))
+                # ここで break して finally へ（disconnectログ書く）
                 break
 
             elif typ == "msg":
@@ -758,14 +896,14 @@ async def ws_endpoint(ws: WebSocket, client_id: str):
                 if not text:
                     continue
 
-                # セッションがある場合だけログ（マッチ中のみ）
                 if me and me.session_id:
                     db_insert_message(me.session_id, client_id, text)
 
-                # 相手に転送
                 if me and me.partner_id and me.partner_id in mm.clients:
                     partner = mm.clients[me.partner_id]
                     await partner.ws.send_text(json.dumps({"type": "msg", "text": text}))
+                else:
+                    await ws.send_text(json.dumps({"type": "system", "text": "まだマッチしていません"}))
 
             else:
                 await ws.send_text(json.dumps({"type": "system", "text": "unknown command"}))
@@ -774,15 +912,9 @@ async def ws_endpoint(ws: WebSocket, client_id: str):
         pass
     finally:
         session_id = None
-        current = mm.clients.get(client_id)
-        if current:
-            session_id = current.session_id
+        info2 = mm.clients.get(client_id)
+        if info2:
+            session_id = info2.session_id
 
-        # disconnectログ
         db_insert_connection("disconnect", client_id, session_id, ip, country, region, city, subdivision, ua)
-
-        # 片付け
         mm.remove_client(client_id)
-
-        # counts配信（残った人へ）
-        await broadcast_counts()
