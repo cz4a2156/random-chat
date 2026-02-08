@@ -4,7 +4,7 @@ import uuid
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 import geoip2.database
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
@@ -18,11 +18,13 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")  # RenderのEnvironmentで設定推�
 GEOIP_DB_PATH = os.getenv("GEOIP_DB_PATH", "GeoLite2-City.mmdb")
 _geo_reader = None
 
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+
 # ---------------------------
-# DB
+# DB helpers
 # ---------------------------
 def db_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -30,11 +32,18 @@ def db_conn() -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
 
+
+def _ensure_column(cur: sqlite3.Cursor, table: str, col: str, col_type: str):
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = {row[1] for row in cur.fetchall()}
+    if col not in cols:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+
+
 def init_db():
     conn = db_conn()
     cur = conn.cursor()
 
-    # 既存を壊さず列を増やすため、CREATEは新規用、ALTERは後から追加
     cur.execute("""
     CREATE TABLE IF NOT EXISTS ws_connections (
         id TEXT PRIMARY KEY,
@@ -51,7 +60,7 @@ def init_db():
     )
     """)
 
-    # 既存DBでregion/city/subdivision列が無い場合に追加
+    # 後から列追加（既存DBを壊さない）
     _ensure_column(cur, "ws_connections", "region", "TEXT")
     _ensure_column(cur, "ws_connections", "city", "TEXT")
     _ensure_column(cur, "ws_connections", "subdivision", "TEXT")
@@ -96,11 +105,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-def _ensure_column(cur: sqlite3.Cursor, table: str, col: str, col_type: str):
-    cur.execute(f"PRAGMA table_info({table})")
-    cols = {row[1] for row in cur.fetchall()}
-    if col not in cols:
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
 
 def db_insert_connection(
     event: str,
@@ -123,6 +127,7 @@ def db_insert_connection(
     conn.commit()
     conn.close()
 
+
 def db_start_session(
     session_id: str,
     a: str,
@@ -141,18 +146,25 @@ def db_start_session(
     conn = db_conn()
     conn.execute(
         """INSERT INTO ws_sessions
-        (session_id, ts_start, client_a, client_b, ip_a, ip_b, country_a, country_b, region_a, region_b, city_a, city_b, subdivision_a, subdivision_b)
+        (session_id, ts_start, client_a, client_b, ip_a, ip_b, country_a, country_b,
+         region_a, region_b, city_a, city_b, subdivision_a, subdivision_b)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (session_id, utc_now_iso(), a, b, ip_a, ip_b, country_a, country_b, region_a, region_b, city_a, city_b, subdivision_a, subdivision_b),
+        (session_id, utc_now_iso(), a, b, ip_a, ip_b, country_a, country_b,
+         region_a, region_b, city_a, city_b, subdivision_a, subdivision_b),
     )
     conn.commit()
     conn.close()
 
+
 def db_end_session(session_id: str):
     conn = db_conn()
-    conn.execute("UPDATE ws_sessions SET ts_end=? WHERE session_id=? AND ts_end IS NULL", (utc_now_iso(), session_id))
+    conn.execute(
+        "UPDATE ws_sessions SET ts_end=? WHERE session_id=? AND ts_end IS NULL",
+        (utc_now_iso(), session_id),
+    )
     conn.commit()
     conn.close()
+
 
 def db_insert_message(session_id: str, sender: str, text: str):
     conn = db_conn()
@@ -163,8 +175,9 @@ def db_insert_message(session_id: str, sender: str, text: str):
     conn.commit()
     conn.close()
 
+
 # ---------------------------
-# IP / Geo (Country/Region/City)
+# IP / Geo
 # ---------------------------
 def get_client_ip(ws: WebSocket) -> str:
     xff = ws.headers.get("x-forwarded-for")
@@ -174,17 +187,19 @@ def get_client_ip(ws: WebSocket) -> str:
         return ws.client.host
     return "unknown"
 
+
 def _get_geo_reader():
     global _geo_reader
     if _geo_reader is None:
         _geo_reader = geoip2.database.Reader(GEOIP_DB_PATH)
     return _geo_reader
 
+
 def get_geo(ip: str) -> Tuple[str, str, str, str]:
     """
     return: (country_code, region_name, city_name, subdivision_name)
     region: 都道府県/州レベル
-    subdivision: “区”っぽい情報が出ることがある（地域DB次第）
+    subdivision: “区”っぽい情報が出ることがある（DB次第）
     """
     if ip in ("unknown", "127.0.0.1"):
         return ("unknown", "unknown", "unknown", "unknown")
@@ -195,22 +210,21 @@ def get_geo(ip: str) -> Tuple[str, str, str, str]:
 
         country = (r.country.iso_code or "unknown").upper()
 
-        # region: subdivisions.most_specific.name が都道府県/州に相当することが多い
         region = "unknown"
         subdivision = "unknown"
         if r.subdivisions:
             most = r.subdivisions.most_specific
             if most and most.name:
                 region = most.name
-            # subdivisions配列に複数ある場合、“区”っぽいものが混ざるケースがある
+            # subdivisionsが複数あると “区” っぽいのが入ることがある（国・DBによる）
             if len(r.subdivisions) >= 2 and r.subdivisions[1].name:
                 subdivision = r.subdivisions[1].name
 
         city = r.city.name or "unknown"
-
         return (country, region, city, subdivision)
     except Exception:
         return ("unknown", "unknown", "unknown", "unknown")
+
 
 def require_admin(request: Request):
     if not ADMIN_TOKEN:
@@ -219,8 +233,9 @@ def require_admin(request: Request):
     if token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
 
+
 # ---------------------------
-# Matchmaking
+# Matchmaking + counts
 # ---------------------------
 @dataclass
 class ClientInfo:
@@ -235,6 +250,7 @@ class ClientInfo:
     partner_id: Optional[str] = None
     session_id: Optional[str] = None
 
+
 class Matchmaker:
     def __init__(self):
         self.clients: Dict[str, ClientInfo] = {}
@@ -242,6 +258,10 @@ class Matchmaker:
 
     def online_count(self) -> int:
         return len(self.clients)
+
+    def idle_count(self) -> int:
+        # 相手がいない（待機中 or 未マッチ）の人数
+        return sum(1 for c in self.clients.values() if c.partner_id is None)
 
     def add_client(self, info: ClientInfo):
         self.clients[info.client_id] = info
@@ -251,6 +271,8 @@ class Matchmaker:
             self.waiting = None
 
         info = self.clients.get(client_id)
+
+        # 相手がいたら相手も解除＆セッション終了
         if info and info.partner_id:
             partner = self.clients.get(info.partner_id)
             if partner:
@@ -264,11 +286,16 @@ class Matchmaker:
 
         self.clients.pop(client_id, None)
 
+        # waitingが死んでたら解除
+        if self.waiting and self.waiting not in self.clients:
+            self.waiting = None
+
     def match(self, client_id: str) -> Tuple[bool, Optional[str]]:
         me = self.clients.get(client_id)
         if not me or me.partner_id:
             return False, None
 
+        # waitingが空 or 無効なら自分をwaitingに
         if not self.waiting or self.waiting not in self.clients or self.clients[self.waiting].partner_id:
             self.waiting = client_id
             return False, None
@@ -282,6 +309,7 @@ class Matchmaker:
             self.waiting = client_id
             return False, None
 
+        # マッチ成立
         session_id = str(uuid.uuid4())
         me.partner_id = other_id
         other.partner_id = client_id
@@ -300,7 +328,30 @@ class Matchmaker:
         )
         return True, other_id
 
+
 mm = Matchmaker()
+
+
+async def broadcast_counts():
+    """
+    全クライアントに接続数・待機数を配信
+    """
+    payload = json.dumps({
+        "type": "counts",
+        "online": mm.online_count(),
+        "idle": mm.idle_count(),
+    })
+
+    dead: List[str] = []
+    for cid, info in mm.clients.items():
+        try:
+            await info.ws.send_text(payload)
+        except Exception:
+            dead.append(cid)
+
+    for cid in dead:
+        mm.remove_client(cid)
+
 
 # ---------------------------
 # FastAPI
@@ -310,21 +361,32 @@ init_db()
 
 INDEX_HTML = f"""
 <!doctype html>
-<html><head><meta charset="utf-8"><title>{APP_TITLE}</title></head>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{APP_TITLE}</title>
+</head>
 <body style="font-family: sans-serif; max-width: 900px; margin: 30px auto;">
   <h2>{APP_TITLE}</h2>
-  <div>
+
+  <div style="display:flex; align-items:center; gap:8px;">
     <button id="btnStart">開始</button>
     <button id="btnNext" disabled>次の人</button>
+    <button id="btnDisconnect" disabled>切断</button>
+    <span id="status" style="margin-left:12px;color:#666;"></span>
   </div>
+
   <div style="border:1px solid #ddd; padding:10px; height:420px; overflow:auto; margin-top:12px;" id="log"></div>
-  <div style="margin-top:12px;">
-    <input id="msg" placeholder="メッセージ..." style="width:75%;">
+
+  <div style="margin-top:12px; display:flex; gap:8px;">
+    <input id="msg" placeholder="メッセージ..." style="flex:1;">
     <button id="btnSend" disabled>送信</button>
   </div>
 
 <script>
 let ws=null;
+
+// 同一ブラウザ内では同一ユーザー扱い（自分とマッチしない）
 let clientId = localStorage.getItem("client_id");
 if(!clientId) {{
   clientId = crypto.randomUUID();
@@ -337,32 +399,79 @@ const log = (s) => {{
   el.scrollTop = el.scrollHeight;
 }};
 
+// ---- SFX (WebAudio) ----
+let audioCtx = null;
+function beep(freq, durationMs, type="sine", gainValue=0.06) {{
+  try {{
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.value = gainValue;
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    setTimeout(() => osc.stop(), durationMs);
+  }} catch(e) {{}}
+}}
+
+function sfxMatched() {{
+  beep(880, 120, "square", 0.05);
+  setTimeout(()=>beep(1175, 160, "square", 0.05), 140);
+}}
+
+function sfxEnded() {{
+  beep(440, 160, "sine", 0.05);
+  setTimeout(()=>beep(330, 220, "sine", 0.05), 180);
+}}
+
+function setStatus(text) {{
+  document.getElementById("status").textContent = text || "";
+}}
+
 function connect() {{
   ws = new WebSocket((location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/ws?client_id="+encodeURIComponent(clientId));
+
   ws.onopen = ()=> {{
     log("✅ 接続しました。マッチング中...");
+    document.getElementById("btnDisconnect").disabled=false;
     ws.send(JSON.stringify({{type:"start"}}));
   }};
+
   ws.onmessage = (ev)=> {{
     const data = JSON.parse(ev.data);
+
     if(data.type==="matched") {{
       log("🎉 マッチしました！");
+      sfxMatched();
       document.getElementById("btnSend").disabled=false;
       document.getElementById("btnNext").disabled=false;
+      document.getElementById("btnDisconnect").disabled=false;
+
     }} else if(data.type==="system") {{
       log("（システム）"+data.text);
+
     }} else if(data.type==="msg") {{
       log("相手: "+data.text);
+
     }} else if(data.type==="ended") {{
       log("🚪 相手が退出しました。終了します。");
+      sfxEnded();
       document.getElementById("btnSend").disabled=true;
       document.getElementById("btnNext").disabled=true;
+
+    }} else if(data.type==="counts") {{
+      setStatus(`接続中: ${{data.online}} / 待機: ${{data.idle}}`);
     }}
   }};
+
   ws.onclose = ()=> {{
     log("🗡 切断しました。");
+    sfxEnded();
     document.getElementById("btnSend").disabled=true;
     document.getElementById("btnNext").disabled=true;
+    document.getElementById("btnDisconnect").disabled=true;
   }};
 }}
 
@@ -380,6 +489,13 @@ document.getElementById("btnNext").onclick=()=> {{
   }}
 }};
 
+document.getElementById("btnDisconnect").onclick=()=> {{
+  if(ws && ws.readyState===1) {{
+    try {{ ws.send(JSON.stringify({{type:"disconnect"}})); }} catch(e) {{}}
+    ws.close();
+  }}
+}};
+
 document.getElementById("btnSend").onclick=()=> {{
   const t=document.getElementById("msg").value;
   if(!t) return;
@@ -388,16 +504,23 @@ document.getElementById("btnSend").onclick=()=> {{
   ws.send(JSON.stringify({{type:"msg", text:t}}));
 }};
 </script>
-</body></html>
+</body>
+</html>
 """
+
 
 @app.get("/", response_class=HTMLResponse)
 def index():
     return INDEX_HTML
 
+
+# ---------------------------
+# Admin APIs
+# ---------------------------
 @app.get("/admin/stats")
 def admin_stats(request: Request):
     require_admin(request)
+
     conn = db_conn()
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM ws_connections WHERE event='connect'")
@@ -410,35 +533,81 @@ def admin_stats(request: Request):
 
     return JSONResponse({
         "online_now": mm.online_count(),
+        "idle_now": mm.idle_count(),
         "total_connects": total_connects,
         "total_disconnects": total_disconnects,
         "total_messages": total_msgs,
     })
 
+
 @app.get("/admin/recent")
 def admin_recent(request: Request, limit: int = 50):
     require_admin(request)
     limit = max(1, min(limit, 200))
+
     conn = db_conn()
     cur = conn.cursor()
     cur.execute(
-        "SELECT ts, event, client_id, session_id, ip, country, region, city, subdivision FROM ws_connections ORDER BY ts DESC LIMIT ?",
+        "SELECT ts, event, client_id, session_id, ip, country, region, city, subdivision "
+        "FROM ws_connections ORDER BY ts DESC LIMIT ?",
         (limit,),
     )
     rows = cur.fetchall()
     conn.close()
+
     return JSONResponse({
         "connections": [
-            {"ts": r[0], "event": r[1], "client_id": r[2], "session_id": r[3], "ip": r[4], "country": r[5], "region": r[6], "city": r[7], "subdivision": r[8]}
+            {
+                "ts": r[0],
+                "event": r[1],
+                "client_id": r[2],
+                "session_id": r[3],
+                "ip": r[4],
+                "country": r[5],
+                "region": r[6],
+                "city": r[7],
+                "subdivision": r[8],
+            }
             for r in rows
         ]
     })
+
+
+@app.get("/admin/messages")
+def admin_messages(request: Request, limit: int = 100):
+    """
+    直近メッセージ（会話ログ）を見る
+    """
+    require_admin(request)
+    limit = max(1, min(limit, 500))
+
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT ts, session_id, sender_client_id, text
+        FROM ws_messages
+        ORDER BY ts DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    return JSONResponse({
+        "messages": [
+            {"ts": r[0], "session_id": r[1], "sender": r[2], "text": r[3]}
+            for r in rows
+        ]
+    })
+
 
 @app.get("/admin/geo_summary")
 def admin_geo_summary(request: Request, region: Optional[str] = None, limit: int = 50):
     """
     地域別（region/city/subdivision）集計
-    region=Osaka などで絞れる
+    region=（実際に出てくる表記）で絞れる
     """
     require_admin(request)
     limit = max(1, min(limit, 200))
@@ -481,37 +650,10 @@ def admin_geo_summary(request: Request, region: Optional[str] = None, limit: int
         ]
     })
 
-@app.get("/admin/osaka_top")
-def admin_osaka_top(request: Request, limit: int = 50):
-    """
-    大阪府内の city/subdivision の上位
-    """
-    require_admin(request)
-    limit = max(1, min(limit, 200))
 
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT city, subdivision, COUNT(*) as c
-        FROM ws_connections
-        WHERE event='connect' AND region = 'Osaka'
-        GROUP BY city, subdivision
-        ORDER BY c DESC
-        LIMIT ?
-        """,
-        (limit,),
-    )
-    rows = cur.fetchall()
-    conn.close()
-
-    return JSONResponse({
-        "rows": [
-            {"city": r[0] or "unknown", "subdivision": r[1] or "unknown", "connects": r[2]}
-            for r in rows
-        ]
-    })
-
+# ---------------------------
+# WebSocket endpoint
+# ---------------------------
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket, client_id: str):
     await ws.accept()
@@ -521,13 +663,22 @@ async def ws_endpoint(ws: WebSocket, client_id: str):
     ua = ws.headers.get("user-agent", "unknown")
 
     info = ClientInfo(
-        ws=ws, client_id=client_id, ip=ip,
-        country=country, region=region, city=city, subdivision=subdivision,
-        ua=ua
+        ws=ws,
+        client_id=client_id,
+        ip=ip,
+        country=country,
+        region=region,
+        city=city,
+        subdivision=subdivision,
+        ua=ua,
     )
     mm.add_client(info)
 
+    # connectログ
     db_insert_connection("connect", client_id, None, ip, country, region, city, subdivision, ua)
+
+    # counts配信
+    await broadcast_counts()
 
     try:
         while True:
@@ -538,56 +689,90 @@ async def ws_endpoint(ws: WebSocket, client_id: str):
             me = mm.clients.get(client_id)
 
             if typ == "start":
-                await ws.send_text(json.dumps({"type":"system", "text":"待機中...相手を探しています"}))
+                await ws.send_text(json.dumps({"type": "system", "text": "待機中...相手を探しています"}))
                 matched, other_id = mm.match(client_id)
                 if matched and other_id:
                     other = mm.clients.get(other_id)
-                    if other:
-                        await me.ws.send_text(json.dumps({"type":"matched"}))
-                        await other.ws.send_text(json.dumps({"type":"matched"}))
+                    if other and me:
+                        await me.ws.send_text(json.dumps({"type": "matched"}))
+                        await other.ws.send_text(json.dumps({"type": "matched"}))
+                await broadcast_counts()
 
             elif typ == "next":
+                # 現在の相手を切って再待機
                 if me and me.partner_id:
                     partner = mm.clients.get(me.partner_id)
                     sid = me.session_id
+
                     me.partner_id = None
                     me.session_id = None
                     if sid:
                         db_end_session(sid)
+
                     if partner:
                         partner.partner_id = None
                         partner.session_id = None
-                        await partner.ws.send_text(json.dumps({"type":"ended"}))
+                        await partner.ws.send_text(json.dumps({"type": "ended"}))
 
                 matched, other_id = mm.match(client_id)
                 if matched and other_id:
                     other = mm.clients.get(other_id)
-                    if other:
-                        await me.ws.send_text(json.dumps({"type":"matched"}))
-                        await other.ws.send_text(json.dumps({"type":"matched"}))
+                    if other and me:
+                        await me.ws.send_text(json.dumps({"type": "matched"}))
+                        await other.ws.send_text(json.dumps({"type": "matched"}))
+
+                await broadcast_counts()
+
+            elif typ == "disconnect":
+                # 自分から切断
+                if me and me.partner_id:
+                    partner = mm.clients.get(me.partner_id)
+                    sid = me.session_id
+
+                    me.partner_id = None
+                    me.session_id = None
+                    if sid:
+                        db_end_session(sid)
+
+                    if partner:
+                        partner.partner_id = None
+                        partner.session_id = None
+                        await partner.ws.send_text(json.dumps({"type": "ended"}))
+
+                await broadcast_counts()
+                await ws.close()
+                break
 
             elif typ == "msg":
                 text = (data.get("text") or "").strip()
                 if not text:
                     continue
 
+                # セッションがある場合だけログ（マッチ中のみ）
                 if me and me.session_id:
                     db_insert_message(me.session_id, client_id, text)
 
+                # 相手に転送
                 if me and me.partner_id and me.partner_id in mm.clients:
                     partner = mm.clients[me.partner_id]
-                    await partner.ws.send_text(json.dumps({"type":"msg", "text":text}))
+                    await partner.ws.send_text(json.dumps({"type": "msg", "text": text}))
 
             else:
-                await ws.send_text(json.dumps({"type":"system", "text":"unknown command"}))
+                await ws.send_text(json.dumps({"type": "system", "text": "unknown command"}))
 
     except WebSocketDisconnect:
         pass
     finally:
         session_id = None
-        info = mm.clients.get(client_id)
-        if info:
-            session_id = info.session_id
+        current = mm.clients.get(client_id)
+        if current:
+            session_id = current.session_id
 
+        # disconnectログ
         db_insert_connection("disconnect", client_id, session_id, ip, country, region, city, subdivision, ua)
+
+        # 片付け
         mm.remove_client(client_id)
+
+        # counts配信（残った人へ）
+        await broadcast_counts()
