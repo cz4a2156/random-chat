@@ -5,7 +5,7 @@ import time
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple
 
 import geoip2.database
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
@@ -241,8 +241,6 @@ def _get_geo_reader():
 def get_geo(ip: str) -> Tuple[str, str, str, str]:
     """
     return: (country_code, region_name, city_name, subdivision_name)
-    region: 都道府県/州っぽい
-    subdivision: 区っぽい（DB次第）
     """
     if ip in ("unknown", "127.0.0.1"):
         return ("unknown", "unknown", "unknown", "unknown")
@@ -468,7 +466,7 @@ function setUIMatched(isMatched) {{
 }}
 
 function beepSequence(steps) {{
-  // WebAudio: steps = [{freq, dur, gap, type}]
+  // WebAudio: steps = [{{freq, dur, gap, type}}]
   try {{
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     let t = ctx.currentTime;
@@ -512,6 +510,13 @@ function playEndSound() {{
   ]);
 }}
 
+function playPingSound() {{
+  // 相手メッセージ：ピコン
+  beepSequence([
+    {{freq: 880, dur: 0.06, gap: 0.00, type:"sine"}},
+  ]);
+}}
+
 async function refreshOnline() {{
   try {{
     const r = await fetch("/api/online");
@@ -543,8 +548,9 @@ function connect() {{
       log("（システム）"+data.text);
     }} else if(data.type==="msg") {{
       log("相手: "+data.text);
+      playPingSound();
     }} else if(data.type==="ended") {{
-      log("🚪 相手が退出しました。終了します。");
+      log("🚪 相手が退出しました。");
       setUIMatched(false);
       playEndSound();
     }} else if(data.type==="disconnect_ack") {{
@@ -561,9 +567,13 @@ function connect() {{
   }};
 }}
 
-document.getElementById("btnStart").onclick = async ()=> {{
-  // iOS等で音を鳴らすにはユーザー操作の直後が安全なので、ここでAudioContextを起こす意図もある
-  if(ws && ws.readyState===1) return;
+document.getElementById("btnStart").onclick = ()=> {{
+  // 接続中なら「start」を投げ直して再マッチできるようにする
+  if(ws && ws.readyState===1) {{
+    ws.send(JSON.stringify({{type:"start"}}));
+    log("（システム）マッチングを再開します...");
+    return;
+  }}
   connect();
 }};
 
@@ -578,6 +588,9 @@ document.getElementById("btnNext").onclick = ()=> {{
 document.getElementById("btnDisconnect").onclick = ()=> {{
   if(ws && ws.readyState===1) {{
     ws.send(JSON.stringify({{type:"disconnect"}}));
+  }} else {{
+    // すでに落ちてたらUIだけ整える
+    setUIConnected(false);
   }}
 }};
 
@@ -781,41 +794,6 @@ def admin_geo_summary(request: Request, region: Optional[str] = None, limit: int
     )
 
 
-# （大阪固定が気になるなら、これは削除してOK。残したい場合だけ使ってね）
-@app.get("/admin/osaka_top")
-def admin_osaka_top(request: Request, limit: int = 50):
-    """
-    大阪府内だけの city/subdivision 上位（オマケ）
-    """
-    require_admin(request)
-    limit = max(1, min(limit, 200))
-
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT city, subdivision, COUNT(*) as c
-        FROM ws_connections
-        WHERE event='connect' AND region = 'Osaka'
-        GROUP BY city, subdivision
-        ORDER BY c DESC
-        LIMIT ?
-        """,
-        (limit,),
-    )
-    rows = cur.fetchall()
-    conn.close()
-
-    return JSONResponse(
-        {
-            "rows": [
-                {"city": r[0] or "unknown", "subdivision": r[1] or "unknown", "connects": r[2]}
-                for r in rows
-            ]
-        }
-    )
-
-
 # =========================
 # WebSocket
 # =========================
@@ -888,8 +866,7 @@ async def ws_endpoint(ws: WebSocket, client_id: str):
                     except Exception:
                         pass
                 await ws.send_text(json.dumps({"type": "disconnect_ack"}))
-                # ここで break して finally へ（disconnectログ書く）
-                break
+                break  # finallyへ
 
             elif typ == "msg":
                 text = (data.get("text") or "").strip()
@@ -911,6 +888,18 @@ async def ws_endpoint(ws: WebSocket, client_id: str):
     except WebSocketDisconnect:
         pass
     finally:
+        # 相手が急に落ちた時に、残ってる側へ ended を送る
+        partner_id = None
+        info2 = mm.clients.get(client_id)
+        if info2:
+            partner_id = info2.partner_id
+
+        if partner_id and partner_id in mm.clients:
+            try:
+                await mm.clients[partner_id].ws.send_text(json.dumps({"type": "ended"}))
+            except Exception:
+                pass
+
         session_id = None
         info2 = mm.clients.get(client_id)
         if info2:
