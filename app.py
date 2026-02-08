@@ -22,6 +22,15 @@ _geo_reader = None
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+import time
+
+def fake_online_offset() -> int:
+    """
+    2分ごとに 3 → 4 → 5 を循環
+    """
+    cycle = (int(time.time()) // 120) % 3  # 120秒ごと
+    return 3 + cycle
+
 
 # ---------------------------
 # DB helpers
@@ -532,7 +541,8 @@ def admin_stats(request: Request):
     conn.close()
 
     return JSONResponse({
-        "online_now": mm.online_count(),
+        "online_real": real,
+        "online_display": real + fake,
         "idle_now": mm.idle_count(),
         "total_connects": total_connects,
         "total_disconnects": total_disconnects,
